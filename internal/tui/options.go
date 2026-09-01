@@ -1,6 +1,9 @@
 package tui
 
-import "github.com/termcord/termcord/internal/config"
+import (
+	"github.com/termcord/termcord/internal/art"
+	"github.com/termcord/termcord/internal/config"
+)
 
 type Options struct {
 	Theme           string
@@ -9,7 +12,17 @@ type Options struct {
 	NotifyOnMention bool
 	ShowEmbeds      bool
 	Timestamps      bool
+	ReduceMotion    bool
+	ImageProtocol   string
+	ShowMascot      bool
 	PluginsEnabled  bool
+	PluginDir       string
+}
+
+// TypingEvent reports who is typing in a channel.
+type TypingEvent struct {
+	ChannelID string
+	Users     []string
 }
 
 func OptionsFromConfig(cfg config.Config) Options {
@@ -20,22 +33,14 @@ func OptionsFromConfig(cfg config.Config) Options {
 		NotifyOnMention: cfg.UI.NotifyOnMention,
 		ShowEmbeds:      cfg.UI.ShowEmbeds,
 		Timestamps:      cfg.UI.Timestamps,
+		ReduceMotion:    cfg.UI.ReduceMotion,
+		ImageProtocol:   cfg.UI.ImageProtocol,
+		ShowMascot:      cfg.UI.ShowMascot,
 		PluginsEnabled:  cfg.Plugins.Enabled,
+		PluginDir:       cfg.PluginDir(),
 	}
 }
 
-const helpText = `termcord commands
-  /join #name      switch channel
-  /threads         list active threads
-  /thread name     open a thread
-  /parent          leave thread
-  /history         load older messages
-  /reply           reply to selected message
-  /react emoji     toggle reaction
-  /search query    search local cache
-  /plugins         list loaded plugins
-  /clear           clear view
-  /quit            exit
-
-keys: ctrl+b sidebar · ctrl+t threads · ctrl+r react
-      ctrl+↑/↓ select msg · pgup/pgdn scroll · ctrl+p/n channel`
+func HelpText() string {
+	return art.HelpBlock()
+}

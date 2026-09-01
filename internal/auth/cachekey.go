@@ -11,6 +11,10 @@ import (
 
 const cacheKeyAccount = "cache-key"
 
+func ClearCacheKey() error {
+	return keyring.Delete(serviceName, cacheKeyAccount)
+}
+
 func ResolveCacheKey() ([]byte, error) {
 	raw, err := keyring.Get(serviceName, cacheKeyAccount)
 	if err != nil {

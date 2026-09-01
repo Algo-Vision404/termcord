@@ -10,8 +10,10 @@ import (
 
 	"github.com/termcord/termcord/internal/auth"
 	"github.com/termcord/termcord/internal/config"
+	"github.com/termcord/termcord/internal/ds"
 	"github.com/termcord/termcord/internal/gateway"
 	"github.com/termcord/termcord/internal/model"
+	"github.com/termcord/termcord/internal/ux"
 	"github.com/termcord/termcord/internal/version"
 )
 
@@ -31,7 +33,7 @@ func main() {
 	case "history":
 		runHistory(os.Args[2:])
 	case "version":
-		fmt.Println("termcord-cli", version.Version)
+		fmt.Println(ds.CLILogo(version.Version))
 	case "help", "-h", "--help":
 		printUsage()
 	default:
@@ -153,12 +155,17 @@ func openClient(configPath string) *gateway.Client {
 }
 
 func exitErr(err error) {
-	fmt.Fprintln(os.Stderr, err)
+	fmt.Fprintln(os.Stderr, ux.Friendly(err))
+	if strings.Contains(strings.ToLower(err.Error()), "no token") {
+		fmt.Fprintln(os.Stderr, "Run: termcord init  then  termcord login")
+	}
 	os.Exit(1)
 }
 
 func printUsage() {
 	fmt.Printf(`termcord-cli %s — headless termcord
+
+Requires: termcord login (or TERMCORD_TOKEN)
 
 Usage:
   termcord-cli send -channel ID message

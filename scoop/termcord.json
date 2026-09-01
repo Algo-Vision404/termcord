@@ -6,7 +6,7 @@
     "architecture": {
         "64bit": {
             "url": "https://github.com/termcord/termcord/releases/download/v0.1.0/termcord_0.1.0_windows_amd64.zip",
-            "hash": "TODO"
+            "hash": "REPLACE_ON_RELEASE"
         }
     },
     "bin": [

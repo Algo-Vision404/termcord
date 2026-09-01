@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/pelletier/go-toml/v2"
+	"github.com/termcord/termcord/internal/security"
 )
 
 type Plugin struct {
@@ -93,7 +94,7 @@ func (p Plugin) Run(ctx RunContext) (string, error) {
 	} else {
 		cmd = exec.Command("sh", "-c", cmdStr)
 	}
-	cmd.Env = append(os.Environ(),
+	cmd.Env = security.PluginEnv(
 		"TERMCORD_CHANNEL_ID="+ctx.ChannelID,
 		"TERMCORD_CHANNEL="+ctx.ChannelName,
 		"TERMCORD_USER="+ctx.Username,

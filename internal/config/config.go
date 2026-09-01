@@ -5,8 +5,10 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 
 	"github.com/pelletier/go-toml/v2"
+	"github.com/termcord/termcord/internal/security"
 )
 
 type Config struct {
@@ -32,6 +34,9 @@ type UI struct {
 	NotifyOnMention bool   `toml:"notify_on_mention"`
 	ShowEmbeds      bool   `toml:"show_embeds"`
 	Timestamps      bool   `toml:"timestamps"`
+	ReduceMotion    bool   `toml:"reduce_motion"`
+	ImageProtocol   string `toml:"image_protocol"`
+	ShowMascot      bool   `toml:"show_mascot"`
 }
 
 type Plugins struct {
@@ -48,12 +53,14 @@ func Default() Config {
 			NotifyOnMention: true,
 			ShowEmbeds:      true,
 			Timestamps:      true,
+			ReduceMotion:    true,
+			ShowMascot:      false,
 		},
 		Cache: Cache{
 			Encrypt: true,
 		},
 		Plugins: Plugins{
-			Enabled: true,
+			Enabled: false,
 		},
 	}
 }
@@ -102,8 +109,30 @@ func Load(path string) (Config, error) {
 	if err := toml.Unmarshal(data, &cfg); err != nil {
 		return cfg, fmt.Errorf("parse config: %w", err)
 	}
+	cfg.applyMascotDefault(string(data))
+	cfg.applySecurityDefaults(string(data))
 	cfg.normalize()
 	return cfg, nil
+}
+
+func (c *Config) applyMascotDefault(raw string) {
+	if !strings.Contains(raw, "show_mascot") {
+		c.UI.ShowMascot = false
+	}
+	if !strings.Contains(raw, "reduce_motion") {
+		c.UI.ReduceMotion = true
+	}
+}
+
+func (c *Config) applySecurityDefaults(raw string) {
+	if !strings.Contains(raw, "[plugins]") {
+		c.Plugins.Enabled = false
+		return
+	}
+	if strings.Contains(raw, "enabled") {
+		return
+	}
+	c.Plugins.Enabled = false
 }
 
 func (c *Config) normalize() {
@@ -146,26 +175,27 @@ func defaultPluginDir() string {
 	}
 }
 
-func Init(path string) (string, error) {
+func Init(path string) (string, bool, error) {
 	if path == "" {
 		path = DefaultConfigPath()
 	}
 	if _, err := os.Stat(path); err == nil {
-		return path, nil
+		return path, false, nil
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return "", err
+	if err := security.EnsureDir(filepath.Dir(path)); err != nil {
+		return "", false, err
 	}
 	cfg := Default()
 	data, err := toml.Marshal(cfg)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	example := "# termcord config — see config.example.toml in the repo for all options\n\n"
-	if err := os.WriteFile(path, append([]byte(example), data...), 0o600); err != nil {
-		return "", err
+	if err := os.WriteFile(path, append([]byte(example), data...), security.FilePerm); err != nil {
+		return "", false, err
 	}
+	_ = security.SecureFile(path)
 	cfgLoaded, _ := Load(path)
-	_ = os.MkdirAll(cfgLoaded.PluginDir(), 0o755)
-	return path, nil
+	_ = security.EnsureDir(cfgLoaded.PluginDir())
+	return path, true, nil
 }

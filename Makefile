@@ -1,7 +1,7 @@
 VERSION ?= $(shell go run ./internal/version/cmd 2>/dev/null || echo 0.1.0)
 LDFLAGS := -s -w -X github.com/termcord/termcord/internal/version.Version=$(VERSION)
 
-.PHONY: build install test clean
+.PHONY: build install test clean security vulncheck release-check
 
 build:
 	go build -ldflags "$(LDFLAGS)" -o bin/termcord ./cmd/termcord
@@ -13,6 +13,13 @@ install:
 
 test:
 	go test ./...
+
+vulncheck:
+	go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+security: test vulncheck
+
+release-check: security build
 
 clean:
 	rm -rf bin/

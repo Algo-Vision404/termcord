@@ -1,21 +1,23 @@
-# termcord
+# termcord 0.1.0
 
-**termcord** is a terminal-native Discord client — direct gateway, local history, no relay.
+**Discord in your terminal.** Direct gateway, local cache, keyboard-first.
 
-> Using a Discord user token violates [Discord's Terms of Service](https://discord.com/terms). Use at your own risk.
+> Using a Discord user token violates [Discord's Terms of Service](https://discord.com/terms). Use at your own risk — termcord stores messages locally and never uses a third-party relay.
 
-## Features (v0.1)
+## What's in 0.1.0
 
-- Full account access — all guilds, DMs, threads (no bot install)
-- Guild-grouped sidebar with unread + @mention badges
-- Message replies, reactions, embed rendering, markdown cleanup
-- Local SQLite cache with `/search` and `/history`
-- Headless CLI for scripts and CI
-- Themes: `default`, `dracula`
-- Encrypted local cache (AES-256-GCM, key in OS keyring)
-- Plugin commands via TOML in plugins directory
-- Gateway reconnect status notifications
-- Token stored in OS keyring — never written to config by default
+- **Spotlight (Ctrl+G)** — fuzzy jump to any channel, DM, or server
+- **Focus mode (Ctrl+F)** — hide sidebar and footer for reading
+- **Mention hop (Ctrl+M)** — cycle channels that @mention you
+- **Guild sidebar** — unread and @mention badges
+- **Replies, reactions, embeds** — read and send like the desktop app
+- **Local SQLite cache** — `/search`, `/history`, optional AES-256 encryption
+- **Doctor** — one command to verify token, REST, and gateway
+- **Headless CLI** — `termcord-cli` for scripts and automation
+- **Themes** — `default`, `dracula`
+- **Plugins** — TOML command hooks in your plugins directory
+
+Calm by default: `reduce_motion = true`, Cordy mascot off. Enable animations or Cordy in `config.toml` if you want them.
 
 ## Install
 
@@ -27,63 +29,50 @@ cd termcord
 make build
 ```
 
-Or on Windows:
+Windows:
 
 ```powershell
 .\scripts\install.ps1
 ```
 
-Scoop (after publishing releases):
-
-```powershell
-scoop bucket add termcord .\scoop
-scoop install termcord
-```
-
-Binaries land in `bin/termcord` and `bin/termcord-cli`.
+Binaries: `bin/termcord.exe` (TUI) and `bin/termcord-cli.exe` (headless).
 
 ## Quick start
 
 ```powershell
-# 1. Create config
-.\bin\termcord.exe init
-
-# 2. Save your Discord user token (prompts if omitted)
-.\bin\termcord.exe login
-
-# 3. Verify connection
-.\bin\termcord.exe doctor
-
-# 4. Launch
-.\bin\termcord.exe
+termcord init
+termcord login
+termcord doctor
+termcord
 ```
 
-Alternative: `$env:TERMCORD_TOKEN = "..."` without keyring.
+1. **`termcord init`** — create config at `%APPDATA%\termcord\config.toml`
+2. **`termcord login`** — save your token to the OS keyring (hidden prompt)
+3. **`termcord doctor`** — verify REST + gateway
+4. **`termcord`** — open the chat UI
 
-## Commands (TUI)
+Session-only token (not saved):
+
+```cmd
+set TERMCORD_TOKEN=your_token_here
+termcord doctor
+```
+
+## Using the TUI
+
+The sidebar lists channels — navigate with **Ctrl+P / Ctrl+N**, **Ctrl+G** (spotlight), or **`/join #name`**.
 
 | Key | Action |
 |-----|--------|
 | Enter | Send / slash command |
+| Ctrl+G | Spotlight — fuzzy jump anywhere |
+| Ctrl+F | Focus mode |
+| Ctrl+M | Hop to next @mention |
 | Ctrl+B | Toggle sidebar |
 | Ctrl+P / Ctrl+N | Previous / next channel |
-| Ctrl+T | Threads panel |
 | Ctrl+R | Quick react (1–5) |
-| Ctrl+↑ / Ctrl+↓ | Select message |
-| PgUp / PgDn | Scroll chat (empty input) |
 | Ctrl+L | Jump to bottom |
-| Ctrl+C | Quit |
-
-| Slash | Action |
-|-------|--------|
-| `/help` | Show commands in chat |
-| `/join #name` | Switch channel |
-| `/history` | Load older messages |
-| `/reply` | Reply to selected message |
-| `/threads` `/thread` `/parent` | Thread navigation |
-| `/react 👍` | Toggle reaction |
-| `/search query` | Search local cache |
-| `/clear` `/quit` | Clear view / exit |
+| /help | Full command list |
 
 ## Headless CLI
 
@@ -91,43 +80,32 @@ Alternative: `$env:TERMCORD_TOKEN = "..."` without keyring.
 termcord-cli whoami
 termcord-cli channels
 termcord-cli history -channel CHANNEL_ID -limit 30
-termcord-cli send -channel CHANNEL_ID "ship it"
-termcord-cli send -channel CHANNEL_ID -reply MSG_ID "ack"
+termcord-cli send -channel CHANNEL_ID "hello from termcord"
 ```
 
 ## Config
 
-Path: `%APPDATA%\termcord\config.toml` (Windows) or `~/.config/termcord/config.toml`.
-
-See [config.example.toml](config.example.toml). Notable options:
+See [config.example.toml](config.example.toml). Path: `%APPDATA%\termcord\config.toml` (Windows) or `~/.config/termcord/config.toml`.
 
 ```toml
 [ui]
-theme = "dracula"
-notify_on_mention = true
-history_page_size = 50
+theme = "default"
+reduce_motion = true   # recommended
+show_mascot = false    # Cordy lane — opt in
+encrypt = true         # under [cache]
 ```
 
-## vs molly-terminal
+Product direction: [docs/VISION.md](docs/VISION.md). UI design: [docs/DESIGN.md](docs/DESIGN.md).
 
-| | molly | termcord |
-|---|-------|----------|
-| Connection | Third-party relay | Direct gateway |
-| Servers | Bot required | All yours |
-| DMs / threads | Limited | Yes |
-| Identity | Webhook/bot | You |
-| Privacy | Messages on relay | Local only |
+## vs relay-based terminal clients
 
-## Project layout
-
-```
-cmd/termcord/          interactive client
-cmd/termcord-cli/      headless commands
-internal/gateway/      Discord connection
-internal/cache/        SQLite message store
-internal/tui/          Bubble Tea UI
-internal/text/         Markdown + embed formatting
-```
+| | Relay client | termcord |
+|---|--------------|----------|
+| Connection | Third-party server | Direct to Discord |
+| Servers | Bot invite per guild | All your servers |
+| DMs / threads | Often limited | Full user client |
+| Message identity | Bot/webhook | You |
+| Offline search | Varies | Encrypted local SQLite |
 
 ## License
 

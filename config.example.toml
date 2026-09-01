@@ -1,4 +1,6 @@
-# Copy to ~/.config/termcord/config.toml (or set TERMCORD_CONFIG)
+# termcord 0.1.0 — example config
+# Windows: %APPDATA%\termcord\config.toml
+# macOS/Linux: ~/.config/termcord/config.toml (or set TERMCORD_CONFIG)
 
 [general]
 # Prefer: termcord login  ·  env TERMCORD_TOKEN  ·  OS keyring
@@ -17,7 +19,14 @@ history_page_size = 50
 notify_on_mention = true
 show_embeds = true
 timestamps = true
+# Calmer UI — fewer animations (recommended). Set false for full motion.
+reduce_motion = true
+# Inline image preview: auto, kitty, iterm2, none
+image_protocol = "auto"
+# Optional ASCII cat lane — set true to enable Cordy
+show_mascot = false
 
 [plugins]
-enabled = true
+# Off by default — plugins run shell commands; only enable plugins you trust
+enabled = false
 # dir = ""  # default: %APPDATA%\termcord\plugins on Windows

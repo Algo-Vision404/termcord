@@ -6,4 +6,7 @@
 *.db-shm
 .env
 config.toml
+*.token
+token.txt
+**/token.txt
 .DS_Store

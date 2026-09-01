@@ -33,6 +33,16 @@ type ChannelSection struct {
 	Channels []Channel
 }
 
+type Attachment struct {
+	ID          string
+	URL         string
+	Filename    string
+	ContentType string
+	Width       int
+	Height      int
+	Size        int
+}
+
 type Message struct {
 	ID              string
 	ChannelID       string
@@ -47,6 +57,7 @@ type Message struct {
 	MentionEveryone bool
 	MentionsMe      bool
 	Embeds          []Embed
+	Attachments     []Attachment
 	Reactions       []Reaction
 }
 

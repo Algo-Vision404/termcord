@@ -5,27 +5,43 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/termcord/termcord/internal/model"
 )
 
+const (
+	userCapabilities   = 16381
+	clientBuildNumber  = 340000
+	gatewayOpenTimeout = 25 * time.Second
+	maxGatewayAttempts = 3
+)
+
 type Client struct {
 	session *discordgo.Session
+	userWS  *userGateway
 	userID  string
 	username string
 
 	mu       sync.RWMutex
 	closing  bool
+	readyCh  chan struct{}
 	guilds   []model.Guild
 	channels map[string][]model.Channel
 	threads  map[string][]model.Channel
 	dms      []model.Channel
+	users    map[string]string
 
 	onReady   func()
 	onMessage func(model.Message)
 	onError   func(error)
 	onStatus  func(string)
+	onTyping  func(string, []string)
+	onChannelsUpdated func()
+
+	typing *typingTracker
+	authToken string
 }
 
 type Options struct {
@@ -35,6 +51,7 @@ type Options struct {
 	OnMessage func(model.Message)
 	OnError   func(error)
 	OnStatus  func(string)
+	OnTyping  func(channelID string, users []string)
 }
 
 func New(opts Options) (*Client, error) {
@@ -51,59 +68,96 @@ func New(opts Options) (*Client, error) {
 		return nil, fmt.Errorf("create session: %w", err)
 	}
 	session.LogLevel = discordgo.LogError
+	configureUserREST(session)
 
 	c := &Client{
 		session:  session,
+		readyCh:  make(chan struct{}),
 		channels: make(map[string][]model.Channel),
 		threads:  make(map[string][]model.Channel),
+		users:    make(map[string]string),
 		onReady:  opts.OnReady,
 		onMessage: opts.OnMessage,
 		onError:  opts.OnError,
 		onStatus: opts.OnStatus,
+		onTyping: opts.OnTyping,
+		authToken: token,
 	}
+	c.typing = newTypingTracker(func(channelID string, users []string) {
+		if c.onTyping != nil {
+			c.onTyping(channelID, users)
+		}
+	})
 
 	session.AddHandler(c.handleReady)
-	session.AddHandler(c.handleMessageCreate)
-	session.AddHandler(c.handleMessageUpdate)
-	session.AddHandler(c.handleThreadCreate)
-	session.AddHandler(c.handleReactionAdd)
-	session.AddHandler(c.handleReactionRemove)
-	session.AddHandler(c.handleDisconnect)
-	session.AddHandler(c.handleConnect)
+
+	c.userWS = newUserGateway(token, session, c)
 
 	return c, nil
 }
 
+func configureUserREST(s *discordgo.Session) {
+	s.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) discord/1.0.9204 Chrome/134.0.0.0 Safari/537.36"
+}
+
 func (c *Client) Open() error {
-	return c.session.Open()
+	var lastErr error
+	for attempt := 0; attempt < maxGatewayAttempts; attempt++ {
+		if attempt > 0 {
+			if c.onStatus != nil {
+				c.onStatus(fmt.Sprintf("retrying gateway (%d/%d)…", attempt+1, maxGatewayAttempts))
+			}
+			time.Sleep(time.Duration(attempt) * time.Second)
+			c.resetGateway()
+		} else if c.onStatus != nil {
+			c.onStatus("connecting gateway…")
+		}
+		lastErr = c.openOnce()
+		if lastErr == nil {
+			if c.onStatus != nil {
+				c.onStatus("gateway connected")
+			}
+			return nil
+		}
+		if !IsReconnectable(lastErr) {
+			return lastErr
+		}
+	}
+	return lastErr
+}
+
+func (c *Client) resetGateway() {
+	c.userWS.close()
+	c.readyCh = make(chan struct{})
+	c.userWS = newUserGateway(c.authToken, c.session, c)
+}
+
+func (c *Client) openOnce() error {
+	if err := c.userWS.open(); err != nil {
+		return err
+	}
+	select {
+	case <-c.readyCh:
+		return nil
+	case err := <-c.userWS.failCh:
+		return err
+	case <-time.After(gatewayOpenTimeout):
+		return fmt.Errorf("couldn't connect within %s — check network or run termcord doctor", gatewayOpenTimeout)
+	}
+}
+
+func (c *Client) Session() *discordgo.Session {
+	return c.session
 }
 
 func (c *Client) Close() error {
 	c.mu.Lock()
 	c.closing = true
 	c.mu.Unlock()
-	return c.session.Close()
-}
-
-func (c *Client) isClosing() bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.closing
-}
-
-func (c *Client) handleConnect(_ *discordgo.Session, _ *discordgo.Connect) {
-	if c.onStatus != nil && !c.isClosing() {
-		c.onStatus("gateway connected")
+	if c.userWS != nil {
+		c.userWS.close()
 	}
-}
-
-func (c *Client) handleDisconnect(_ *discordgo.Session, _ *discordgo.Disconnect) {
-	if c.isClosing() {
-		return
-	}
-	if c.onStatus != nil {
-		c.onStatus("disconnected — reconnecting…")
-	}
+	return nil
 }
 
 func (c *Client) UserID() string {
@@ -221,8 +275,14 @@ func (c *Client) handleReady(_ *discordgo.Session, r *discordgo.Ready) {
 	for _, g := range r.Guilds {
 		c.guilds = append(c.guilds, model.Guild{ID: g.ID, Name: g.Name})
 	}
+	select {
+	case <-c.readyCh:
+	default:
+		close(c.readyCh)
+	}
 	c.mu.Unlock()
 
+	go c.resolveDMNames()
 	go c.loadGuildChannels(r.Guilds)
 }
 
@@ -276,7 +336,9 @@ func (c *Client) handleMessageCreate(_ *discordgo.Session, m *discordgo.MessageC
 	if c.onMessage == nil {
 		return
 	}
-	c.onMessage(c.mapMessage(m.Message))
+	msg := c.mapMessage(m.Message)
+	c.enrichChannelFromMessage(msg.ChannelID, msg.AuthorID, msg.Author)
+	c.onMessage(msg)
 }
 
 func (c *Client) handleMessageUpdate(_ *discordgo.Session, m *discordgo.MessageUpdate) {
@@ -294,6 +356,7 @@ func (c *Client) mapMessage(m *discordgo.Message) model.Message {
 	if m.Author != nil {
 		author = m.Author.Username
 		authorID = m.Author.ID
+		c.rememberUser(authorID, author)
 		if m.Member != nil && m.Member.Nick != "" {
 			author = m.Member.Nick
 		}
@@ -322,7 +385,7 @@ func (c *Client) mapMessage(m *discordgo.Message) model.Message {
 			}
 		}
 	}
-	return model.Message{
+	out := model.Message{
 		ID:              m.ID,
 		ChannelID:       m.ChannelID,
 		Author:          author,
@@ -335,8 +398,11 @@ func (c *Client) mapMessage(m *discordgo.Message) model.Message {
 		MentionEveryone: m.MentionEveryone,
 		MentionsMe:      mentionsMe,
 		Embeds:          mapEmbeds(m.Embeds),
+		Attachments:     mapAttachments(m.Attachments),
 		Reactions:       mapReactions(m.Reactions),
 	}
+	c.noteAuthor(out)
+	return out
 }
 
 func mapEmbeds(embeds []*discordgo.MessageEmbed) []model.Embed {
@@ -362,6 +428,30 @@ func mapEmbeds(embeds []*discordgo.MessageEmbed) []model.Embed {
 		out = append(out, entry)
 	}
 	return out
+}
+
+func (c *Client) SendTyping(channelID string) error {
+	if channelID == "" {
+		return nil
+	}
+	return c.session.ChannelTyping(channelID)
+}
+
+func (c *Client) TypingUsers(channelID string) []string {
+	if c.typing == nil {
+		return nil
+	}
+	return c.typing.Names(channelID)
+}
+
+func (c *Client) AuthToken() string {
+	return c.authToken
+}
+
+func (c *Client) noteAuthor(msg model.Message) {
+	if c.typing != nil {
+		c.typing.rememberName(msg.AuthorID, msg.Author)
+	}
 }
 
 func isTextLike(t discordgo.ChannelType) bool {
@@ -394,14 +484,30 @@ func dmKind(t discordgo.ChannelType) model.ChannelKind {
 }
 
 func channelDisplayName(ch *discordgo.Channel) string {
-	if ch.Name != "" {
+	if ch == nil {
+		return "channel"
+	}
+	if ch.Name != "" && !looksLikeSnowflake(ch.Name) {
 		return ch.Name
 	}
 	if len(ch.Recipients) == 1 && ch.Recipients[0] != nil {
 		return ch.Recipients[0].Username
 	}
 	if len(ch.Recipients) > 1 {
-		return "group-dm"
+		names := make([]string, 0, len(ch.Recipients))
+		for _, u := range ch.Recipients {
+			if u != nil && u.Username != "" {
+				names = append(names, u.Username)
+			}
+		}
+		if len(names) > 0 {
+			label := strings.Join(names, ", ")
+			if len(label) > 32 {
+				return label[:29] + "..."
+			}
+			return label
+		}
+		return "Group chat"
 	}
-	return ch.ID
+	return "Direct Message"
 }

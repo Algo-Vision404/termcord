@@ -10,11 +10,15 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/termcord/termcord/internal/art"
 	"github.com/termcord/termcord/internal/cache"
+	"github.com/termcord/termcord/internal/ds"
 	"github.com/termcord/termcord/internal/gateway"
 	"github.com/termcord/termcord/internal/model"
 	"github.com/termcord/termcord/internal/plugins"
+	"github.com/termcord/termcord/internal/termimg"
 	"github.com/termcord/termcord/internal/text"
+	"github.com/termcord/termcord/internal/ux"
 	"github.com/termcord/termcord/internal/version"
 )
 
@@ -25,7 +29,14 @@ type msgHistory struct {
 	messages []model.Message
 	channel  string
 	prepend  bool
+	cached   bool
 }
+type msgSearchDone struct {
+	query   string
+	results []model.Message
+	err     error
+}
+type msgSelectChannel struct{ channelID string }
 type msgSent struct{ err error }
 type msgErr struct{ err error }
 type msgThreadsLoaded struct {
@@ -35,6 +46,14 @@ type msgThreadsLoaded struct {
 }
 type msgReactionDone struct{ err error }
 type msgStatus struct{ text string }
+type msgTypingUpdate struct {
+	channelID string
+	users     []string
+}
+type msgAnimTick struct{}
+
+const animIntervalBusy = 150 * time.Millisecond
+const quitAnimFrames = 8
 
 var quickReactions = []string{"👍", "❤️", "😂", "🔥", "✅"}
 
@@ -70,20 +89,44 @@ type App struct {
 	vp    viewport.Model
 	input textinput.Model
 
-	status      string
-	ready       bool
-	quitting    bool
+	status         string
+	ready          bool
+	quitting       bool
+	frame          int
+	loadingHistory bool
+
+	spotlightOpen    bool
+	spotlight        textinput.Model
+	spotlightIndex   int
+	spotlightResults []model.Channel
+
+	focusMode   bool
+	showWelcome bool
+	mentionHop  int
+
+	typingUsers    []string
+	imageCache     map[string]string
+	imageProto     termimg.Protocol
+	lastTypingSent time.Time
+	tabIndex       int
+	tabMatches     []string
+	lastInput      string
+	mascotFlash    int
+	cordy          art.CordyPet
+	cordyLaneRow   int
 }
 
 func New(client *gateway.Client, store *cache.Store, opts Options, pluginList []plugins.Plugin) *App {
 	ti := textinput.New()
-	ti.Placeholder = "Message or /help"
-	ti.Focus()
+	ti.Placeholder = "Message…  /help for commands"
+	ti.Prompt = "❯ "
+	theme, themeNote := LoadTheme(opts.Theme)
+	ti.PromptStyle = theme.Banner.Copy().Bold(true)
 	ti.CharLimit = 2000
-	ti.Width = 80
+	ti.Width = 40
+	ti.Focus()
 
 	vp := viewport.New(80, 20)
-	vp.SetContent("Connecting to Discord…")
 
 	if opts.SidebarWidth <= 0 {
 		opts.SidebarWidth = 32
@@ -92,21 +135,60 @@ func New(client *gateway.Client, store *cache.Store, opts Options, pluginList []
 		opts.HistoryPageSize = 50
 	}
 
-	return &App{
+	app := &App{
 		client:      client,
 		store:       store,
 		opts:        opts,
-		theme:       LoadTheme(opts.Theme),
+		theme:       theme,
 		plugins:     pluginList,
-		sidebarOpen: true,
+		sidebarOpen: false,
 		input:       ti,
 		vp:          vp,
-		status:      "connecting…",
+		spotlight:   newSpotlightInput(theme),
+		status:      "Connecting to Discord…",
+		imageCache:  make(map[string]string),
+		imageProto:  termimg.Resolve(opts.ImageProtocol),
 	}
+	if themeNote != "" {
+		app.status = themeNote
+	}
+	app.updateInputPlaceholder()
+	app.initCordyLane()
+	return app
+}
+
+func tickAnim() tea.Cmd {
+	return tea.Tick(animIntervalBusy, func(time.Time) tea.Msg { return msgAnimTick{} })
+}
+
+func (a *App) needsMotionTick() bool {
+	if a.quitting || !a.ready || a.loadingHistory {
+		return true
+	}
+	if a.opts.ShowMascot && !a.opts.ReduceMotion {
+		return true
+	}
+	if !a.opts.ReduceMotion && a.needsDecorRefresh() {
+		return true
+	}
+	return false
+}
+
+func (a *App) needsDecorRefresh() bool {
+	if a.quitting || !a.ready || a.loadingHistory {
+		return true
+	}
+	if a.showWelcome && a.activeChannel != "" && len(a.messages) == 0 {
+		return true
+	}
+	if len(a.messages) == 0 && a.activeChannel != "" {
+		return !a.opts.ReduceMotion
+	}
+	return false
 }
 
 func (a *App) Init() tea.Cmd {
-	return tea.Batch(waitReady(a.client), textinput.Blink)
+	return tea.Batch(waitReady(a.client), textinput.Blink, tickAnim())
 }
 
 func waitReady(client *gateway.Client) tea.Cmd {
@@ -131,6 +213,10 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case msgReady:
 		a.applyConnected()
+		if len(a.channels) == 0 {
+			a.status = "Connected, but no channels yet — try termcord doctor"
+		}
+		a.refreshDecor()
 		if len(a.channels) > 0 && a.activeChannel == "" {
 			a.channelIndex = 0
 			return a, a.selectChannel(a.channels[0].ID)
@@ -143,6 +229,10 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case msgIncoming:
 		_ = a.store.UpsertMessage(context.Background(), m.message)
+		a.notifyCordyActivity()
+		if m.message.AuthorID == a.client.UserID() {
+			a.mascotFlash = 24
+		}
 		if m.message.ChannelID == a.activeChannel {
 			a.messages = upsertMessage(a.messages, m.message)
 			a.ensureMessageCursor()
@@ -155,13 +245,13 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case msgThreadsLoaded:
 		if m.err != nil {
-			a.status = "threads: " + m.err.Error()
+			a.status = ux.Friendly(m.err)
 			return a, nil
 		}
 		if m.parent == a.threadParentID() {
 			a.threads = m.threads
 			if len(a.threads) == 0 {
-				a.status = "no active threads"
+				a.status = "no active threads in this channel"
 			} else {
 				a.status = fmt.Sprintf("%d threads in #%s", len(a.threads), a.parentChannelName())
 			}
@@ -171,13 +261,17 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case msgReactionDone:
 		a.reactMode = false
 		if m.err != nil {
-			a.status = "reaction failed: " + m.err.Error()
+			a.status = ux.Friendly(m.err)
 		} else {
 			a.status = "reaction updated"
 		}
 		return a, nil
 
 	case msgHistory:
+		a.loadingHistory = false
+		if m.cached {
+			a.status = ux.CachedHistoryNotice("")
+		}
 		if m.prepend {
 			a.messages = append(m.messages, a.messages...)
 		} else {
@@ -192,22 +286,82 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case msgSent:
 		if m.err != nil {
-			a.status = "send failed: " + m.err.Error()
+			a.status = ux.FriendlySend(m.err)
 			return a, nil
 		}
 		a.input.SetValue("")
 		a.replyToID = ""
+		a.updateInputPlaceholder()
 		return a, nil
 
 	case msgErr:
-		a.status = m.err.Error()
+		a.status = ux.Friendly(m.err)
 		return a, nil
+
+	case msgSearchDone:
+		if m.err != nil {
+			a.status = ux.Friendly(m.err)
+			return a, nil
+		}
+		if len(m.results) == 0 {
+			a.status = fmt.Sprintf("no matches for \"%s\" in local cache", m.query)
+			return a, nil
+		}
+		a.injectSystem(fmt.Sprintf("search results for \"%s\" (%d) — /clear to return to live view", m.query, len(m.results)))
+		a.messages = m.results
+		a.ensureMessageCursor()
+		a.renderMessages()
+		a.vp.GotoBottom()
+		a.status = fmt.Sprintf("showing %d search results", len(m.results))
+		return a, nil
+
+	case msgSelectChannel:
+		a.input.SetValue("")
+		return a, a.selectChannel(m.channelID)
 
 	case msgStatus:
 		a.status = m.text
 		return a, nil
 
+	case msgTypingUpdate:
+		if m.channelID == a.activeChannel {
+			a.typingUsers = m.users
+		}
+		return a, nil
+
+	case msgAnimTick:
+		a.frame++
+		if a.mascotFlash > 0 {
+			a.mascotFlash--
+		}
+		a.tickCordy()
+		if a.quitting {
+			if a.frame >= quitAnimFrames {
+				return a, tea.Quit
+			}
+			return a, tickAnim()
+		}
+		if a.needsDecorRefresh() {
+			a.refreshDecor()
+		}
+		a.input.Prompt = "❯ "
+		if a.needsMotionTick() {
+			return a, tickAnim()
+		}
+		return a, nil
+
+	case tea.MouseMsg:
+		return a.handleCordyMouse(m)
+
 	case tea.KeyMsg:
+		a.notifyCordyActivity()
+		if a.spotlightOpen {
+			return a.updateSpotlight(m)
+		}
+		if a.showWelcome && m.Type != tea.KeyCtrlC {
+			a.showWelcome = false
+			a.refreshDecor()
+		}
 		if a.reactMode {
 			switch m.String() {
 			case "esc":
@@ -225,6 +379,14 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if a.input.Value() == "" {
 			switch m.String() {
 			case "pgup", "pgdown", "up", "down":
+				if a.activeChannel == "" && len(a.channels) > 0 {
+					switch m.String() {
+					case "up":
+						return a, a.prevChannel()
+					case "down":
+						return a, a.nextChannel()
+					}
+				}
 				var cmd tea.Cmd
 				a.vp, cmd = a.vp.Update(msg)
 				return a, cmd
@@ -232,10 +394,46 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		switch {
-		case m.Type == tea.KeyCtrlC, m.String() == "ctrl+q":
+		case m.Type == tea.KeyCtrlC:
+			if a.quitting {
+				return a, tea.Quit
+			}
 			a.quitting = true
-			return a, tea.Quit
+			a.frame = 0
+			a.status = "Closing… (Ctrl+C again to quit now)"
+			return a, tickAnim()
+		case m.String() == "ctrl+q":
+			a.quitting = true
+			a.frame = 0
+			a.status = "closing…"
+			return a, tickAnim()
+		case m.String() == "esc":
+			if a.replyToID != "" {
+				a.replyToID = ""
+				a.updateInputPlaceholder()
+				a.status = "reply cancelled"
+				return a, nil
+			}
+		case m.String() == "ctrl+g":
+			a.openSpotlight()
+			return a, textinput.Blink
+		case m.String() == "ctrl+f":
+			a.focusMode = !a.focusMode
+			if a.focusMode {
+				a.sidebarOpen = false
+				a.status = "Focus mode — sidebar hidden (Ctrl+F to restore chrome)"
+			} else {
+				a.status = fmt.Sprintf("Connected as @%s%s", a.client.Username(), a.activityDigest())
+			}
+			a.layout()
+			return a, nil
+		case m.String() == "ctrl+m":
+			return a, a.hopMention()
 		case m.String() == "ctrl+b":
+			if a.focusMode {
+				a.status = "exit focus mode first (ctrl+f)"
+				return a, nil
+			}
 			a.sidebarOpen = !a.sidebarOpen
 			a.layout()
 			return a, nil
@@ -252,7 +450,7 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			a.ensureMessageCursor()
 			a.reactMode = true
-			a.status = "react: 1=👍 2=❤️ 3=😂 4=🔥 5=✅ · esc cancel"
+			a.status = "React: press 1–5 for 👍 ❤️ 😂 🔥 ✅ · Esc to cancel"
 			return a, nil
 		case m.String() == "ctrl+up":
 			a.moveMessageCursor(-1)
@@ -267,6 +465,13 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case m.String() == "ctrl+l":
 			a.vp.GotoBottom()
 			return a, nil
+		case m.String() == "ctrl+y":
+			a.scritchCordy()
+			return a, nil
+		case m.String() == "tab":
+			if !a.reactMode {
+				return a.handleTab()
+			}
 		case m.Type == tea.KeyEnter:
 			if a.reactMode {
 				return a, nil
@@ -283,7 +488,14 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	var cmd tea.Cmd
+	prev := a.input.Value()
 	a.input, cmd = a.input.Update(msg)
+	onInputChanged(a, a.input)
+	if a.input.Value() != prev && strings.TrimSpace(a.input.Value()) != "" {
+		if typingCmd := a.sendTypingIfNeeded(); typingCmd != nil {
+			return a, tea.Batch(cmd, typingCmd)
+		}
+	}
 	return a, cmd
 }
 
@@ -296,7 +508,8 @@ func scheduleSlowRefresh() tea.Cmd {
 func (a *App) applyConnected() {
 	a.ready = true
 	a.syncChannels()
-	a.status = fmt.Sprintf("connected as @%s", a.client.Username())
+	a.showWelcome = true
+	a.status = fmt.Sprintf("Connected as @%s%s", a.client.Username(), a.activityDigest())
 }
 
 func (a *App) syncChannels() {
@@ -327,6 +540,9 @@ func (a *App) syncChannels() {
 				break
 			}
 		}
+		if ch, ok := a.client.FindChannel(prev); ok {
+			a.activeChannelName = a.client.DisplayName(ch)
+		}
 	}
 }
 
@@ -339,19 +555,270 @@ func (a *App) flatFromSections() []model.Channel {
 }
 
 func (a *App) View() string {
+	opts := a.sceneOpts()
 	if a.quitting {
-		return a.theme.Dim.Render("Goodbye.\n")
+		return a.theme.Dim.Render(art.RenderFarewell(a.frame, opts))
 	}
-	title := a.theme.Header.Render("termcord "+version.Version) + " " + a.theme.Status.Render(a.status)
-	bar := a.theme.ChannelBar.Render(a.channelBarTitle())
+	bar := a.renderAppBar()
+	if a.spotlightOpen {
+		parts := []string{bar}
+		if a.showCordy() {
+			if cordy := a.renderCordyLane(); cordy != "" {
+				parts = append(parts, cordy)
+			}
+		}
+		parts = append(parts, a.renderSpotlightOverlay())
+		return lipgloss.JoinVertical(lipgloss.Left, parts...)
+	}
+	cordy := a.renderCordyLane()
 	main := a.renderMain()
-	footer := a.theme.Footer.Render("ctrl+b sidebar · ctrl+t threads · ctrl+r react · /help · ctrl+c quit")
-	return lipgloss.JoinVertical(lipgloss.Left, title, bar, main, a.input.View(), footer)
+	inner := a.chromeInner()
+	input := ds.RenderComposeRow(a.theme, inner, a.input.View())
+	parts := []string{bar}
+	if a.showCordy() {
+		if cordy == "" {
+			cordy = a.renderCordyLane()
+		}
+		if cordy != "" {
+			parts = append(parts, cordy)
+		}
+	}
+	parts = append(parts, main, input)
+	if !a.focusMode {
+		parts = append(parts, a.renderFooter())
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, parts...)
+}
+
+func (a *App) renderAppBar() string {
+	status := a.status
+	if status == "" {
+		status = fmt.Sprintf("Connected as @%s%s", a.client.Username(), a.activityDigest())
+	}
+	if a.focusMode && !strings.Contains(strings.ToLower(status), "focus") {
+		status += " · focus mode"
+	}
+	badge := ""
+	if !a.opts.ReduceMotion {
+		busy := !a.ready || a.loadingHistory
+		if busy {
+			badge = art.PulseDot(a.frame)
+		} else if a.opts.ShowMascot {
+			badge = a.sceneOpts().Badge(a.frame)
+		}
+	}
+	label := a.channelBarTitle()
+	if a.loadingHistory && !a.opts.ReduceMotion {
+		label += " " + art.Spinner(a.frame)
+	}
+	return ds.RenderAppBar(a.theme, a.chromeInner(), version.Version, status, badge, label)
+}
+
+func (a *App) renderHeader() string {
+	return a.renderAppBar()
+}
+
+func (a *App) renderChannelBar() string {
+	return a.renderAppBar()
+}
+
+func (a *App) renderFooter() string {
+	return ds.RenderStatusFooter(a.theme, a.chromeInner())
+}
+
+func (a *App) chromeInner() int {
+	return ds.PanelInner(a.width)
+}
+
+func (a *App) chatInner() int {
+	return ds.ChatInner(a.width, a.opts.SidebarWidth, a.sidebarOpen)
+}
+
+func (a *App) shouldAnimate() bool {
+	return a.needsMotionTick()
+}
+
+func (a *App) loadingChannelLabel() string {
+	name := a.activeChannelName
+	if name == "" {
+		return "channel"
+	}
+	if ch, ok := a.client.FindChannel(a.activeChannel); ok {
+		if ch.Kind == model.ChannelDM || ch.Kind == model.ChannelGroupDM {
+			return "@" + name
+		}
+	}
+	return "#" + name
+}
+
+func (a *App) updateInputPlaceholder() {
+	if a.replyToID != "" {
+		a.input.Placeholder = "Reply…  Esc to cancel"
+		return
+	}
+	a.input.Placeholder = "Message…  /help for commands"
+}
+
+func (a *App) composeTitle() string {
+	if a.spotlightOpen {
+		return "jump"
+	}
+	if a.replyToID != "" {
+		return "reply"
+	}
+	return "message"
+}
+
+func (a *App) sceneOpts() art.SceneOpts {
+	return art.SceneOpts{
+		Mode:         a.mascotMode(),
+		ReduceMotion: a.opts.ReduceMotion,
+		ShowMascot:   a.opts.ShowMascot,
+		Bubble:       a.loadingChannelLabel(),
+	}
+}
+
+func (a *App) mascotMode() art.MascotMode {
+	if a.quitting {
+		return art.MascotFarewell
+	}
+	if !a.ready {
+		return art.MascotConnecting
+	}
+	if a.loadingHistory {
+		return art.MascotLoading
+	}
+	if a.spotlightOpen {
+		return art.MascotSpotlight
+	}
+	if a.reactMode {
+		return art.MascotReact
+	}
+	if a.mascotFlash > 0 {
+		return art.MascotSent
+	}
+	if len(a.typingUsers) > 0 {
+		return art.MascotWatch
+	}
+	if strings.TrimSpace(a.input.Value()) != "" {
+		return art.MascotCompose
+	}
+	for _, ch := range a.channels {
+		if ch.Mention {
+			return art.MascotMention
+		}
+	}
+	if a.showWelcome && a.activeChannel != "" && len(a.messages) == 0 {
+		return art.MascotWelcome
+	}
+	if len(a.messages) == 0 && a.activeChannel != "" {
+		return art.MascotEmpty
+	}
+	return art.MascotIdle
+}
+
+func (a *App) activityDigest() string {
+	unread, mentions := 0, 0
+	for _, ch := range a.channels {
+		unread += ch.Unread
+		if ch.Mention {
+			mentions++
+		}
+	}
+	if unread == 0 && mentions == 0 {
+		return ""
+	}
+	var parts []string
+	if unread > 0 {
+		parts = append(parts, fmt.Sprintf("%d unread", unread))
+	}
+	if mentions > 0 {
+		parts = append(parts, fmt.Sprintf("%d @", mentions))
+	}
+	return " · " + strings.Join(parts, " · ")
+}
+
+func (a *App) countGuilds() int {
+	n := 0
+	for _, sec := range a.sections {
+		if sec.GuildID != "" {
+			n++
+		}
+	}
+	return n
+}
+
+func (a *App) hopMention() tea.Cmd {
+	var targets []model.Channel
+	for _, ch := range a.channels {
+		if ch.Mention {
+			targets = append(targets, ch)
+		}
+	}
+	if len(targets) == 0 {
+		a.status = "no @mentions right now"
+		return nil
+	}
+	a.mentionHop = (a.mentionHop + 1) % len(targets)
+	ch := targets[a.mentionHop]
+	a.status = fmt.Sprintf("mention hop → %s", a.client.DisplayLabel(ch))
+	return a.selectChannel(ch.ID)
+}
+
+func (a *App) refreshDecor() {
+	if a.quitting {
+		return
+	}
+	opts := a.sceneOpts()
+	frame := a.frame
+	if a.opts.ReduceMotion {
+		frame = 0
+	}
+	if !a.ready {
+		a.vp.SetContent(a.theme.Dim.Render(art.RenderConnecting(frame, version.Version, opts)))
+		return
+	}
+	if a.loadingHistory {
+		opts.Bubble = a.loadingChannelLabel()
+		a.vp.SetContent(a.theme.Dim.Render(art.RenderLoading(frame, a.loadingChannelLabel(), opts)))
+		return
+	}
+	if a.showWelcome && a.activeChannel != "" && len(a.messages) == 0 {
+		a.vp.SetContent(a.theme.Dim.Render(art.RenderWelcome(
+			a.client.Username(),
+			len(a.channels),
+			a.countGuilds(),
+			opts,
+		)))
+		return
+	}
+	if len(a.messages) == 0 && a.activeChannel != "" {
+		a.vp.SetContent(a.theme.Dim.Render(art.RenderEmpty(frame, opts)))
+		return
+	}
+	if len(a.messages) > 0 {
+		a.renderMessages()
+	}
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func (a *App) channelBarTitle() string {
+	base := a.channelBarBase()
+	if len(a.typingUsers) == 0 {
+		return base
+	}
+	return base + " · " + a.theme.Dim.Render(formatTyping(a.typingUsers))
+}
+
+func (a *App) channelBarBase() string {
 	if a.activeChannel == "" {
-		return "  pick a channel"
+		return "Select a channel"
 	}
 	if a.activeParentID != "" {
 		return fmt.Sprintf("  ↳ %s", a.activeChannelName)
@@ -365,15 +832,48 @@ func (a *App) channelBarTitle() string {
 	return "  #" + a.activeChannelName
 }
 
+func formatTyping(names []string) string {
+	switch len(names) {
+	case 0:
+		return ""
+	case 1:
+		return names[0] + " is typing…"
+	case 2:
+		return names[0] + " and " + names[1] + " are typing…"
+	default:
+		return fmt.Sprintf("%s and %d others are typing…", names[0], len(names)-1)
+	}
+}
+
+func (a *App) sendTypingIfNeeded() tea.Cmd {
+	if a.activeChannel == "" {
+		return nil
+	}
+	if time.Since(a.lastTypingSent) < 8*time.Second {
+		return nil
+	}
+	a.lastTypingSent = time.Now()
+	channelID := a.activeChannel
+	client := a.client
+	return func() tea.Msg {
+		_ = client.SendTyping(channelID)
+		return nil
+	}
+}
+
 func (a *App) renderMain() string {
 	chat := a.vp.View()
 	if !a.sidebarOpen {
 		return chat
 	}
-	return lipgloss.JoinHorizontal(lipgloss.Top, a.renderSidebar(), chat)
+	sep := a.theme.Border.Render("│")
+	return lipgloss.JoinHorizontal(lipgloss.Top, a.renderSidebar(), sep, chat)
 }
 
 func (a *App) renderSidebar() string {
+	if len(a.sections) == 0 {
+		return lipgloss.NewStyle().Width(a.opts.SidebarWidth).Render(a.theme.Dim.Render("Loading channels…"))
+	}
 	var b strings.Builder
 	for si, sec := range a.sections {
 		if si > 0 {
@@ -383,17 +883,21 @@ func (a *App) renderSidebar() string {
 		if len(title) > a.opts.SidebarWidth-2 {
 			title = title[:a.opts.SidebarWidth-5] + "..."
 		}
-		b.WriteString(a.theme.SidebarTitle.Render(title))
+		b.WriteString(a.theme.SidebarTitle.Render(" " + title))
 		b.WriteString("\n")
 		for _, ch := range sec.Channels {
-			label := formatChannelLabel(ch)
+			label := a.client.DisplayLabel(ch)
 			if ch.Mention {
 				label = a.theme.Mention.Render("@ " + label)
 			} else if ch.Unread > 0 {
 				label = a.theme.Unread.Render(fmt.Sprintf("%s (%d)", label, ch.Unread))
 			}
 			if ch.ID == a.activeChannel || (a.activeParentID != "" && ch.ID == a.activeParentID) {
-				label = a.theme.Active.Render("> " + label)
+				marker := ">"
+				if a.shouldAnimate() && !a.opts.ReduceMotion {
+					marker = activeMarker(a.frame)
+				}
+				label = a.theme.Active.Render(marker + " " + label)
 			} else {
 				label = "  " + label
 			}
@@ -403,7 +907,7 @@ func (a *App) renderSidebar() string {
 	}
 	if a.threadsOpen {
 		b.WriteString("\n")
-		b.WriteString(a.theme.SidebarTitle.Render("Threads · " + a.parentChannelName()))
+		b.WriteString(a.theme.SidebarTitle.Render(" Threads · " + a.parentChannelName()))
 		b.WriteString("\n")
 		if len(a.threads) == 0 {
 			b.WriteString(a.theme.Dim.Render("  (none)"))
@@ -423,21 +927,22 @@ func (a *App) renderSidebar() string {
 	return lipgloss.NewStyle().Width(a.opts.SidebarWidth).Render(b.String())
 }
 
-func formatChannelLabel(ch model.Channel) string {
-	switch ch.Kind {
-	case model.ChannelDM:
-		return "@" + ch.Name
-	default:
-		return "#" + ch.Name
-	}
+func activeMarker(frame int) string {
+	markers := []string{">", "▸", "›", "▸"}
+	return markers[frame%len(markers)]
 }
 
 func (a *App) renderMessages() {
 	if len(a.messages) == 0 {
-		a.vp.SetContent(a.theme.Dim.Render("No messages yet. Type to send or /help for commands."))
+		opts := a.sceneOpts()
+		frame := a.frame
+		if a.opts.ReduceMotion {
+			frame = 0
+		}
+		a.vp.SetContent(a.theme.Dim.Render(art.RenderEmpty(frame, opts)))
 		return
 	}
-	width := a.vp.Width - 4
+	width := a.vp.Width
 	if width < 20 {
 		width = 20
 	}
@@ -448,6 +953,9 @@ func (a *App) renderMessages() {
 			line = a.theme.Selected.Render("▸ " + line)
 		}
 		lines = append(lines, line)
+		if i < len(a.messages)-1 {
+			lines = append(lines, "")
+		}
 	}
 	a.vp.SetContent(strings.Join(lines, "\n"))
 }
@@ -458,7 +966,10 @@ func (a *App) formatMessageLine(msg model.Message, width int) string {
 		head = fmt.Sprintf("%s ", a.theme.Dim.Render(msg.Timestamp.Local().Format("15:04")))
 	}
 	author := a.theme.User.Render(msg.Author)
-	body := text.RenderDiscord(msg.Content, width)
+	body := text.RenderDiscordWithResolvers(msg.Content, width, text.MentionResolvers{
+		User:    a.client.ResolveUserName,
+		Channel: a.client.ResolveChannelMention,
+	})
 	body = text.HighlightLinks(body, func(s string) string { return a.theme.Link.Render(s) })
 	if a.opts.ShowEmbeds && len(msg.Embeds) > 0 {
 		embeds := make([]text.Embed, 0, len(msg.Embeds))
@@ -493,6 +1004,12 @@ func (a *App) formatMessageLine(msg model.Message, width int) string {
 	if len(msg.Reactions) > 0 {
 		line += "\n  " + a.renderReactions(msg.Reactions)
 	}
+	if len(msg.Attachments) > 0 {
+		att := termimg.FormatAttachments(msg.Attachments, a.imageProto, a.client.AuthToken(), a.imageCache)
+		if att != "" {
+			line += "\n" + att
+		}
+	}
 	return line
 }
 
@@ -511,22 +1028,39 @@ func (a *App) renderReactions(reactions []model.Reaction) string {
 }
 
 func (a *App) layout() {
-	sidebar := 0
-	if a.sidebarOpen {
-		sidebar = a.opts.SidebarWidth + 1
-	}
-	chatW := a.width - sidebar - 2
-	if chatW < 20 {
-		chatW = 20
-	}
-	chatH := a.height - 7
+	chatInner := a.chatInner()
+	chatH := a.height - a.chromeHeight()
 	if chatH < 5 {
 		chatH = 5
 	}
-	a.vp.Width = chatW
+	a.vp.Width = chatInner
 	a.vp.Height = chatH
-	a.input.Width = a.width - 2
+
+	promptW := lipgloss.Width(a.input.Prompt)
+	fieldW := a.chromeInner() - promptW - 2
+	if fieldW < 12 {
+		fieldW = 12
+	}
+	a.input.Width = fieldW
+	a.spotlight.Width = min(a.width-8, 64)
+	a.cordyLaneRow = 6
 	a.renderMessages()
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func (a *App) chromeHeight() int {
+	// app bar(4) + compose(2) + footer(1)
+	h := 7
+	if a.focusMode {
+		h = 6
+	}
+	return h + a.cordyChromeRows()
 }
 
 func (a *App) selectChannel(channelID string) tea.Cmd {
@@ -534,7 +1068,7 @@ func (a *App) selectChannel(channelID string) tea.Cmd {
 		if ch.ID == channelID {
 			a.channelIndex = i
 			a.activeChannel = ch.ID
-			a.activeChannelName = ch.Name
+			a.activeChannelName = a.client.DisplayName(ch)
 			a.activeGuildName = ch.GuildName
 			a.activeParentID = ""
 			break
@@ -552,17 +1086,19 @@ func (a *App) selectChannel(channelID string) tea.Cmd {
 	for _, th := range a.threads {
 		if th.ID == channelID {
 			a.activeChannel = th.ID
-			a.activeChannelName = th.Name
+			a.activeChannelName = a.client.DisplayName(th)
 			a.activeParentID = th.ParentID
 			break
 		}
 	}
 
+	a.loadingHistory = true
 	a.messages = nil
 	a.messageCursor = -1
 	a.reactMode = false
 	a.replyToID = ""
-	a.vp.SetContent(a.theme.Dim.Render("Loading history…"))
+	a.typingUsers = a.client.TypingUsers(channelID)
+	a.refreshDecor()
 	limit := a.opts.HistoryPageSize
 	client := a.client
 	store := a.store
@@ -572,7 +1108,7 @@ func (a *App) selectChannel(channelID string) tea.Cmd {
 		if err != nil {
 			cached, cacheErr := store.ListMessages(ctx, channelID, limit, "")
 			if cacheErr == nil && len(cached) > 0 {
-				return msgHistory{messages: cached, channel: channelID}
+				return msgHistory{messages: cached, channel: channelID, cached: true}
 			}
 			return msgErr{err: err}
 		}
@@ -614,16 +1150,22 @@ func (a *App) runCommand(input string) tea.Cmd {
 
 	switch name {
 	case "help":
-		a.injectSystem(helpText)
+		a.injectSystem(HelpText())
+		a.input.SetValue("")
+		return nil
+	case "cordy", "pet":
+		a.scritchCordy()
 		a.input.SetValue("")
 		return nil
 	case "quit":
 		a.quitting = true
-		return tea.Quit
+		a.frame = 0
+		return tickAnim()
 	case "clear":
 		a.messages = nil
 		a.renderMessages()
 		a.input.SetValue("")
+		a.status = "screen cleared — cached history kept"
 		return nil
 	case "join":
 		if len(args) == 0 {
@@ -632,12 +1174,12 @@ func (a *App) runCommand(input string) tea.Cmd {
 		}
 		target := strings.TrimPrefix(args[0], "#")
 		for _, ch := range a.channels {
-			if strings.EqualFold(ch.Name, target) {
+			if strings.EqualFold(a.client.DisplayName(ch), target) || strings.EqualFold(ch.Name, target) {
 				a.input.SetValue("")
 				return a.selectChannel(ch.ID)
 			}
 		}
-		a.status = "channel not found: " + target
+		a.status = fmt.Sprintf("channel not found: %s — try /join #exact-name or ctrl+p/n", target)
 		return nil
 	case "history":
 		a.input.SetValue("")
@@ -649,12 +1191,13 @@ func (a *App) runCommand(input string) tea.Cmd {
 		}
 		a.ensureMessageCursor()
 		a.replyToID = a.messages[a.messageCursor].ID
-		a.status = "replying — type message and press enter"
+		a.updateInputPlaceholder()
+		a.status = fmt.Sprintf("replying to %s — type below, esc to cancel", a.messages[a.messageCursor].Author)
 		a.input.SetValue("")
 		return nil
 	case "search":
 		if len(args) == 0 {
-			a.status = "usage: /search query"
+			a.status = "usage: /search your query"
 			return nil
 		}
 		query := strings.Join(args, " ")
@@ -663,9 +1206,9 @@ func (a *App) runCommand(input string) tea.Cmd {
 		return func() tea.Msg {
 			results, err := store.Search(context.Background(), query, 20)
 			if err != nil {
-				return msgErr{err: err}
+				return msgSearchDone{query: query, err: err}
 			}
-			return msgHistory{messages: results, channel: a.activeChannel}
+			return msgSearchDone{query: query, results: results}
 		}
 	case "threads":
 		a.input.SetValue("")
@@ -677,14 +1220,14 @@ func (a *App) runCommand(input string) tea.Cmd {
 			return nil
 		}
 		a.input.SetValue("")
-		return a.joinThreadByName(strings.Join(args, " "))
+		return a.openThreadByName(strings.Join(args, " "))
 	case "parent":
 		parent := a.activeParentID
 		if parent == "" {
 			parent = a.client.ParentChannelID(a.activeChannel)
 		}
 		if parent == "" {
-			a.status = "not inside a thread"
+			a.status = "not in a thread — open a server channel first"
 			return nil
 		}
 		a.input.SetValue("")
@@ -699,7 +1242,7 @@ func (a *App) runCommand(input string) tea.Cmd {
 	case "plugins":
 		a.input.SetValue("")
 		if len(a.plugins) == 0 {
-			a.injectSystem("no plugins loaded — add .toml files to the plugins directory")
+			a.injectSystem(ux.PluginDirHint(a.opts.PluginDir))
 			return nil
 		}
 		var lines []string
@@ -715,7 +1258,7 @@ func (a *App) runCommand(input string) tea.Cmd {
 				return a.runPlugin(p, strings.Join(args, " "))
 			}
 		}
-		a.status = "unknown command — try /help"
+		a.status = fmt.Sprintf("unknown command: /%s — type /help", name)
 		return nil
 	}
 }
@@ -736,7 +1279,7 @@ func (a *App) runPlugin(p plugins.Plugin, args string) tea.Cmd {
 			return msgErr{err: err}
 		}
 		if out == "" {
-			return msgStatus{text: "plugin " + p.Name + " finished"}
+			return msgStatus{text: "plugin " + p.Name + " finished (no output)"}
 		}
 		return msgIncoming{message: model.Message{
 			Author:    "plugin:" + p.Name,
@@ -778,7 +1321,7 @@ func (a *App) loadOlderHistory() tea.Cmd {
 			return msgErr{err: err}
 		}
 		if len(older) == 0 {
-			return msgErr{err: fmt.Errorf("no older messages")}
+			return msgStatus{text: ux.Friendly(fmt.Errorf("no older messages"))}
 		}
 		for _, msg := range older {
 			_ = store.UpsertMessage(ctx, msg)
@@ -829,13 +1372,35 @@ func (a *App) markUnread(msg model.Message) {
 func (a *App) loadThreads() tea.Cmd {
 	parentID := a.threadParentID()
 	if parentID == "" {
-		a.status = "threads require a guild text channel"
+		a.status = "threads only work in server text channels — pick a #channel first"
 		return nil
 	}
 	client := a.client
 	return func() tea.Msg {
 		threads, err := client.FetchActiveThreads(parentID)
 		return msgThreadsLoaded{threads: threads, parent: parentID, err: err}
+	}
+}
+
+func (a *App) openThreadByName(name string) tea.Cmd {
+	parentID := a.threadParentID()
+	if parentID == "" {
+		a.status = "open a server #channel first, then /thread name"
+		return nil
+	}
+	name = strings.TrimPrefix(name, "↳ ")
+	client := a.client
+	return func() tea.Msg {
+		threads, err := client.FetchActiveThreads(parentID)
+		if err != nil {
+			return msgErr{err: err}
+		}
+		for _, th := range threads {
+			if strings.EqualFold(th.Name, name) {
+				return msgSelectChannel{channelID: th.ID}
+			}
+		}
+		return msgErr{err: fmt.Errorf("thread not found: %s — try /threads to list active threads", name)}
 	}
 }
 
@@ -925,9 +1490,12 @@ func upsertMessage(messages []model.Message, incoming model.Message) []model.Mes
 	return append(messages, incoming)
 }
 
-func Run(client *gateway.Client, store *cache.Store, opts Options, pluginList []plugins.Plugin, incoming <-chan model.Message, status <-chan string) error {
+func Run(client *gateway.Client, store *cache.Store, opts Options, pluginList []plugins.Plugin, incoming <-chan model.Message, status <-chan string, typing <-chan TypingEvent) error {
 	app := New(client, store, opts, pluginList)
-	p := tea.NewProgram(app, tea.WithAltScreen())
+	p := tea.NewProgram(app, tea.WithAltScreen(), tea.WithMouseCellMotion())
+	client.SetOnChannelsUpdated(func() {
+		p.Send(msgRefreshChannels{})
+	})
 	go func() {
 		for msg := range incoming {
 			p.Send(msgIncoming{message: msg})
@@ -936,6 +1504,11 @@ func Run(client *gateway.Client, store *cache.Store, opts Options, pluginList []
 	go func() {
 		for s := range status {
 			p.Send(msgStatus{text: s})
+		}
+	}()
+	go func() {
+		for ev := range typing {
+			p.Send(msgTypingUpdate{channelID: ev.ChannelID, users: ev.Users})
 		}
 	}()
 	_, err := p.Run()

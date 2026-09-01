@@ -14,14 +14,24 @@ var (
 )
 
 func RenderDiscord(content string, width int) string {
+	return RenderDiscordWithResolvers(content, width, MentionResolvers{})
+}
+
+type MentionResolvers struct {
+	User    func(id string) string
+	Channel func(id string) string
+	Role    func(id string) string
+}
+
+func RenderDiscordWithResolvers(content string, width int, refs MentionResolvers) string {
 	if content == "" {
 		return ""
 	}
 	s := content
 	s = customEmoji.ReplaceAllString(s, ":$2:")
-	s = mentionRe.ReplaceAllString(s, "@user")
-	s = roleMention.ReplaceAllString(s, "@role")
-	s = channelRe.ReplaceAllString(s, "#channel")
+	s = replaceMentions(s, mentionRe, "@", refs.User, "user")
+	s = replaceMentions(s, roleMention, "@", refs.Role, "role")
+	s = replaceMentions(s, channelRe, "#", refs.Channel, "channel")
 	s = strings.ReplaceAll(s, "||", "")
 	s = boldify(s)
 	s = codify(s)
@@ -29,6 +39,22 @@ func RenderDiscord(content string, width int) string {
 		s = wrapLines(s, width)
 	}
 	return s
+}
+
+func replaceMentions(s string, re *regexp.Regexp, prefix string, lookup func(string) string, fallback string) string {
+	return re.ReplaceAllStringFunc(s, func(match string) string {
+		parts := re.FindStringSubmatch(match)
+		if len(parts) < 2 {
+			return prefix + fallback
+		}
+		if lookup != nil {
+			if name := strings.TrimSpace(lookup(parts[1])); name != "" {
+				name = strings.TrimPrefix(name, prefix)
+				return prefix + name
+			}
+		}
+		return prefix + fallback
+	})
 }
 
 func HighlightLinks(s string, style func(string) string) string {
@@ -113,38 +139,48 @@ type EmbedField struct {
 
 func (e Embed) String() string {
 	var b strings.Builder
-	b.WriteString("┌─ embed")
-	if e.Title != "" {
-		b.WriteString(" · ")
-		b.WriteString(e.Title)
+	title := strings.TrimSpace(e.Title)
+	if title == "" {
+		title = "embed"
 	}
+	b.WriteString("  ▸ ")
+	b.WriteString(title)
 	b.WriteString("\n")
 	if e.Author != "" {
-		b.WriteString("│ ")
+		b.WriteString("    ")
 		b.WriteString(e.Author)
 		b.WriteString("\n")
 	}
 	if e.Description != "" {
 		for _, line := range strings.Split(e.Description, "\n") {
-			b.WriteString("│ ")
-			b.WriteString(strings.TrimSpace(line))
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			b.WriteString("    ")
+			if len(line) > 72 {
+				line = line[:69] + "..."
+			}
+			b.WriteString(line)
 			b.WriteString("\n")
 		}
 	}
 	for _, f := range e.Fields {
-		b.WriteString("│ ")
+		b.WriteString("    ")
 		b.WriteString(f.Name)
 		b.WriteString(": ")
-		b.WriteString(strings.ReplaceAll(f.Value, "\n", " "))
+		val := strings.ReplaceAll(f.Value, "\n", " ")
+		if len(val) > 64 {
+			val = val[:61] + "..."
+		}
+		b.WriteString(val)
 		b.WriteString("\n")
 	}
 	if e.URL != "" {
-		b.WriteString("└ ")
+		b.WriteString("    ")
 		b.WriteString(e.URL)
-	} else {
-		b.WriteString("└")
 	}
-	return b.String()
+	return strings.TrimRight(b.String(), "\n")
 }
 
 func FormatMessage(content string, embeds []Embed, width int) string {

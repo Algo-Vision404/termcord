@@ -10,6 +10,12 @@ func TestDefaultConfig(t *testing.T) {
 	if !cfg.UI.NotifyOnMention {
 		t.Fatal("expected notify on mention")
 	}
+	if cfg.Plugins.Enabled {
+		t.Fatal("plugins should be disabled by default")
+	}
+	if !cfg.Cache.Encrypt {
+		t.Fatal("cache encryption should be on by default")
+	}
 }
 
 func TestCachePath(t *testing.T) {

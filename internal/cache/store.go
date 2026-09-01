@@ -5,8 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -32,7 +30,7 @@ func Open(path string) (*Store, error) {
 
 func OpenWith(opts Options) (*Store, error) {
 	path := opts.Path
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := secureDir(parentDir(path)); err != nil {
 		return nil, fmt.Errorf("create cache dir: %w", err)
 	}
 	db, err := sql.Open("sqlite", path+"?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)")
@@ -51,6 +49,10 @@ func OpenWith(opts Options) (*Store, error) {
 	if err := s.migrate(); err != nil {
 		_ = db.Close()
 		return nil, err
+	}
+	if err := secureFile(path); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("secure cache file: %w", err)
 	}
 	return s, nil
 }

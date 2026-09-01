@@ -15,27 +15,40 @@ const (
 )
 
 func ResolveToken(configToken string) (string, error) {
+	var raw string
 	if v := strings.TrimSpace(os.Getenv(envVar)); v != "" {
-		return v, nil
+		raw = v
+	} else if v := strings.TrimSpace(configToken); v != "" {
+		raw = v
+	} else {
+		token, err := keyring.Get(serviceName, accountName)
+		if err != nil {
+			return "", fmt.Errorf("no token found — run termcord init, then termcord login (or set %s)", envVar)
+		}
+		raw = token
 	}
-	if v := strings.TrimSpace(configToken); v != "" {
-		return v, nil
-	}
-	token, err := keyring.Get(serviceName, accountName)
-	if err != nil {
-		return "", fmt.Errorf("no token found: set %s, config general.token, or run termcord login", envVar)
-	}
-	return token, nil
+	return NormalizeToken(raw)
 }
 
 func StoreToken(token string) error {
-	token = strings.TrimSpace(token)
-	if token == "" {
-		return fmt.Errorf("empty token")
+	normalized, err := NormalizeToken(token)
+	if err != nil {
+		return err
 	}
-	return keyring.Set(serviceName, accountName, token)
+	return keyring.Set(serviceName, accountName, normalized)
 }
 
 func ClearToken() error {
 	return keyring.Delete(serviceName, accountName)
+}
+
+// TokenSource reports where ResolveToken would read the token from.
+func TokenSource(configToken string) string {
+	if v := strings.TrimSpace(os.Getenv(envVar)); v != "" {
+		return "environment"
+	}
+	if v := strings.TrimSpace(configToken); v != "" {
+		return "config"
+	}
+	return "keyring"
 }

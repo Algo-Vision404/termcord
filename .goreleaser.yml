@@ -1,21 +1,57 @@
-version: 1
+version: 2
 project_name: termcord
+
+before:
+  hooks:
+    - go mod tidy
+
 builds:
   - id: termcord
     main: ./cmd/termcord
     binary: termcord
     goos: [linux, darwin, windows]
     goarch: [amd64, arm64]
+    ldflags:
+      - -s -w
+      - -X github.com/termcord/termcord/internal/version.Version={{.Version}}
   - id: termcord-cli
     main: ./cmd/termcord-cli
     binary: termcord-cli
     goos: [linux, darwin, windows]
     goarch: [amd64, arm64]
+    ldflags:
+      - -s -w
+      - -X github.com/termcord/termcord/internal/version.Version={{.Version}}
+
 archives:
   - format: zip
     builds: [termcord, termcord-cli]
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - README.md
+      - config.example.toml
+
 checksum:
   name_template: checksums.txt
+
 snapshot:
   name_template: "{{ incpatch .Version }}-next"
+
+release:
+  github:
+    owner: termcord
+    name: termcord
+  draft: false
+  prerelease: false
+
+brews:
+  - name: termcord
+    homepage: https://github.com/termcord/termcord
+    description: Terminal-native Discord client — direct gateway, local cache
+    license: MIT
+    install: |
+      bin.install "termcord"
+      bin.install "termcord-cli"
+    test: |
+      system "#{bin}/termcord", "version"
