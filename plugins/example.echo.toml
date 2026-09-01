@@ -1,0 +1,4 @@
+[[plugin]]
+name = "echo"
+description = "Echo arguments back to chat"
+command = "echo $ARGS"

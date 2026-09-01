@@ -1,0 +1,21 @@
+version: 1
+project_name: termcord
+builds:
+  - id: termcord
+    main: ./cmd/termcord
+    binary: termcord
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+  - id: termcord-cli
+    main: ./cmd/termcord-cli
+    binary: termcord-cli
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+archives:
+  - format: zip
+    builds: [termcord, termcord-cli]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+checksum:
+  name_template: checksums.txt
+snapshot:
+  name_template: "{{ incpatch .Version }}-next"

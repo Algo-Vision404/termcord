@@ -1,0 +1,23 @@
+# Copy to ~/.config/termcord/config.toml (or set TERMCORD_CONFIG)
+
+[general]
+# Prefer: termcord login  ·  env TERMCORD_TOKEN  ·  OS keyring
+token = ""
+
+[cache]
+# Local SQLite path. Empty = platform default.
+path = ""
+# Encrypt message bodies at rest (AES-256-GCM, key in OS keyring)
+encrypt = true
+
+[ui]
+theme = "default"          # default, dracula
+sidebar_width = 32
+history_page_size = 50
+notify_on_mention = true
+show_embeds = true
+timestamps = true
+
+[plugins]
+enabled = true
+# dir = ""  # default: %APPDATA%\termcord\plugins on Windows

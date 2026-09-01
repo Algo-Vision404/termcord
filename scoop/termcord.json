@@ -1,0 +1,26 @@
+{
+    "version": "0.1.0",
+    "description": "Terminal-native Discord client — direct gateway, local cache",
+    "homepage": "https://github.com/termcord/termcord",
+    "license": "MIT",
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/termcord/termcord/releases/download/v0.1.0/termcord_0.1.0_windows_amd64.zip",
+            "hash": "TODO"
+        }
+    },
+    "bin": [
+        "termcord.exe",
+        "termcord-cli.exe"
+    ],
+    "checkver": {
+        "github": "https://github.com/termcord/termcord"
+    },
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "https://github.com/termcord/termcord/releases/download/v$version/termcord_$version_windows_amd64.zip"
+            }
+        }
+    }
+}
